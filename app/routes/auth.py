@@ -13,8 +13,10 @@ from app.utils.hash_utils import hash_password
 
 from fastapi import Query
 from uuid import uuid4
-from app.utils.email_utils import send_email
+from app.utils.email_utils import send_reset_email
 auth_router = APIRouter()
+reset_tokens = {}
+verification_tokens = {}
 
 @auth_router.post("/register")
 async def register(data: RegisterSchema):
@@ -40,7 +42,6 @@ async def login(data: LoginSchema):
 
 
 # Temporary in-memory store for verification tokens (for prod use DB or cache)
-verification_tokens = {}
 
 @auth_router.post("/send-verification-email")
 async def send_verification_email(email: str = Query(...)):
@@ -55,7 +56,7 @@ async def send_verification_email(email: str = Query(...)):
 
     verify_link = f"http://yourfrontend.com/verify-email?token={token}"
     body = f"Click here to verify your email: {verify_link}"
-    send_email(email, "Verify your email", body)
+    send_reset_email(email, "Verify your email", body)
     return {"msg": "Verification email sent"}
 
 @auth_router.get("/verify-email")
@@ -67,7 +68,6 @@ async def verify_email(token: str = Query(...)):
     await user_collection.update_one({"email": email}, {"$set": {"is_verified": True}})
     del verification_tokens[token]
     return {"msg": "Email verified successfully"}
-reset_tokens = {}
 
 @auth_router.post("/forgot-password")
 async def forgot_password(email: str):
@@ -76,12 +76,25 @@ async def forgot_password(email: str):
         raise HTTPException(status_code=404, detail="User not found")
 
     token = str(uuid4())
-    reset_tokens[token] = email
+    reset_tokens[token] = email  # 🧠 Temp storage
 
-    reset_link = f"http://yourfrontend.com/reset-password?token={token}"
-    body = f"Click here to reset your password: {reset_link}"
-    send_email(email, "Password Reset Request", body)
-    return {"msg": "Password reset email sent"}
+    # 👇 Frontend reset page (replace later with your deployed link)
+    reset_link = f"http://localhost:3000/reset-password?token={token}"
+    subject = "🔑 Password Reset Request"
+    body = f"""
+    As-salaamu 'alaykum 👋,\n
+    You requested to reset your password.\n
+    Click this link to reset: {reset_link}\n
+    If you didn’t request this, just ignore it.\n
+    -- Team S8Globals
+    """
+
+    try:
+        send_reset_email(email, subject, body)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
+
+    return {"msg": "✅ Password reset email sent successfully"}
 
 @auth_router.post("/reset-password")
 async def reset_password(data: ResetPasswordSchema):

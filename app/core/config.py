@@ -12,7 +12,7 @@ class Settings:
     ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
     REFRESH_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "10080"))
     SMTP_SERVER: str = os.getenv("SMTP_SERVER")
-    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT"))
     SMTP_USER: str = os.getenv("SMTP_USER")
     SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD")
     ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL")
