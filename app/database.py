@@ -16,3 +16,5 @@ db = client.get_default_database()
 
 # Collections
 user_collection = db["users"]
+
+booking_collection = db["bookings"]

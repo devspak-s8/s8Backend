@@ -13,7 +13,7 @@ from app.utils.hash_utils import hash_password
 
 from fastapi import Query
 from uuid import uuid4
-from app.utils.email_utils import send_reset_email
+from app.utils.email_utils import send_email
 auth_router = APIRouter()
 reset_tokens = {}
 verification_tokens = {}
@@ -56,7 +56,7 @@ async def send_verification_email(email: str = Query(...)):
 
     verify_link = f"http://yourfrontend.com/verify-email?token={token}"
     body = f"Click here to verify your email: {verify_link}"
-    send_reset_email(email, "Verify your email", body)
+    send_email(email, "Verify your email", body)
     return {"msg": "Verification email sent"}
 
 @auth_router.get("/verify-email")
@@ -90,7 +90,7 @@ async def forgot_password(email: str):
     """
 
     try:
-        send_reset_email(email, subject, body)
+        send_email(email, subject, body)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
 
