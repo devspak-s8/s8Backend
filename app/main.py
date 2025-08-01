@@ -3,6 +3,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes.auth import auth_router
+from app.routes.bookings import booking_router
+from app.routes.ws import ws_router
 from app.database import user_collection  # <-- make sure this is the correct path to user_collection
 import logging
 
@@ -19,7 +21,8 @@ app.add_middleware(
 
 # Include auth routes with /api/auth prefix
 app.include_router(auth_router, prefix="/api/auth")
-
+app.include_router(booking_router, prefix="/api/bookings")
+app.include_router(ws_router, prefix="/api/ws")
 @app.get("/")
 async def root():
     return {"message": "Welcome to S8Builder Auth API"}
