@@ -79,7 +79,7 @@ async def forgot_password(email: str):
     reset_tokens[token] = email  # 🧠 Temp storage
 
     # 👇 Frontend reset page (replace later with your deployed link)
-    reset_link = f"http://localhost:3000/reset-password?token={token}"
+    reset_link = f"https://s8builder.s8globals.org//reset-password?token={token}"
     subject = "🔑 Password Reset Request"
     body = f"""
     As-salaamu 'alaykum 👋,\n
