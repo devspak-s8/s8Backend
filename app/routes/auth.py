@@ -1,11 +1,11 @@
 # app/routes/auth_routes.py
 from datetime import timedelta
-from fastapi import APIRouter, HTTPException, Depends, Security
+from fastapi import APIRouter, Body, HTTPException, Depends, Security
 from app.middleware.rbac import get_current_user
 from app.schemas.user import *
 from app.models.user import User
 from app.utils.hash_utils import hash_password, verify_password
-from app.utils.auth_utils import create_access_token
+from app.utils.auth_utils import create_access_token, decode_token, create_refresh_token
 from app.database import user_collection
 from app.core.config import settings
 
@@ -37,11 +37,37 @@ async def login(data: LoginSchema):
     token_data = {"email": user["email"], "role": user["role"]}
     return {
         "access_token": create_access_token(token_data),
-        "refresh_token": create_access_token(token_data, timedelta(days=7))
+        "refresh_token": create_refresh_token(token_data, timedelta(days=7))  # <--- change here
     }
 
 
-# Temporary in-memory store for verification tokens (for prod use DB or cache)
+@auth_router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(refresh_token: str = Body(...)):
+    try:
+        payload = decode_token(refresh_token, expected_type="refresh")  # 🔥 Explicitly decode as refresh
+        email = payload.get("email")
+        role = payload.get("role")
+
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+
+        user = await user_collection.find_one({"email": email})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        token_data = {"email": email, "role": role}
+        access_token = create_access_token(token_data)
+        refresh_token_new = create_refresh_token(token_data, timedelta(days=7))  # ✅ Fixed here
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token_new,
+        }
+
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+#Temporary in-memory store for verification tokens (for prod use DB or cache)
 
 @auth_router.post("/send-verification-email")
 async def send_verification_email(email: str = Query(...)):

@@ -11,14 +11,18 @@ import logging
 app = FastAPI(title="S8Builder Auth API")
 
 # Enable CORS for testing (adjust origins in production)
+origins = [
+    "http://localhost:5173",  # <-- React dev server origin
+    # Add other allowed origins if needed
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=origins,    # Don't just use ["*"] in prod, be specific
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Include auth routes with /api/auth prefix
 app.include_router(auth_router, prefix="/api/auth")
 app.include_router(booking_router, prefix="/api/bookings")

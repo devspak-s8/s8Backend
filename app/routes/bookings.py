@@ -1,3 +1,5 @@
+from datetime import datetime
+from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List
 from bson import ObjectId
@@ -9,21 +11,27 @@ from app.middleware.rbac import get_current_user, is_admin as get_admin_user
 from app.routes.ws import broadcast_booking_update
 from app.utils.meet_link_and_mail import send_meeting_email
 
-booking_router = APIRouter(prefix="/bookings", tags=["Bookings"])
+booking_router = APIRouter( tags=["Bookings"])
 
-# Create booking
+
 @booking_router.post("/", response_model=BookingOut)
 async def create_booking(data: BookingCreate, user=Depends(get_current_user)):
-    new_booking = data.dict()
-    new_booking["user_id"] = str(user["_id"])
-    new_booking["status"] = "pending"
-    new_booking["meet_link"] = None
+    new_booking = {
+        "booking_id": str(uuid4()),
+        "user_id": str(user["_id"]),
+        "name": user["name"],
+        "email": user["email"],
+        "date": data.date,
+        "notes": data.notes,
+        "status": "pending",
+        "meet_link": None,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
 
     result = await booking_collection.insert_one(new_booking)
     new_booking["_id"] = str(result.inserted_id)
     return new_booking
-
-
 # Get current user's bookings
 @booking_router.get("/my", response_model=List[BookingOut])
 async def get_my_bookings(user=Depends(get_current_user)):
