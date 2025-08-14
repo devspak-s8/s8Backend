@@ -1,4 +1,5 @@
 from datetime import datetime
+import traceback
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List
@@ -16,22 +17,31 @@ booking_router = APIRouter( tags=["Bookings"])
 
 @booking_router.post("/", response_model=BookingOut)
 async def create_booking(data: BookingCreate, user=Depends(get_current_user)):
-    new_booking = {
-        "booking_id": str(uuid4()),
-        "user_id": str(user["_id"]),
-        "name": user["name"],
-        "email": user["email"],
-        "date": data.date,
-        "notes": data.notes,
-        "status": "pending",
-        "meet_link": None,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
-    }
+    try:
+        new_booking = {
+            "booking_id": str(uuid4()),
+            "userid": str(user["_id"]), 
+            "name": user["name"],
+            "email": user["email"],
+            "date": data.date,
+            "notes": data.notes,
+            "status": "pending",
+            "meet_link": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
 
-    result = await booking_collection.insert_one(new_booking)
-    new_booking["_id"] = str(result.inserted_id)
-    return new_booking
+        result = await booking_collection.insert_one(new_booking)
+        new_booking["id"] = str(result.inserted_id)   # 🟢 Match Pydantic schema
+        print("📌 New booking created:", new_booking)
+
+        return new_booking
+
+    except Exception as e:
+        print("❌ Booking creation failed:", e)
+        traceback.print_exc() 
+        raise HTTPException(status_code=500, detail="Booking creation failed")
+
 # Get current user's bookings
 @booking_router.get("/my", response_model=List[BookingOut])
 async def get_my_bookings(user=Depends(get_current_user)):
