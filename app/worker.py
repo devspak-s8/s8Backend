@@ -136,8 +136,12 @@ def poll_sqs():
 async def process_stuck_templates():
     stuck_templates = template_collection.find({"status": "pending"})
     async for template in stuck_templates:
+        s3_key = template.get("zip_s3_key")
+        if not s3_key:
+            print(f"[Worker] Skipping template {template['_id']} — no zip_s3_key found")
+            continue
         print(f"[Worker] Found stuck template {template['_id']}, processing...")
-        await process_template(str(template["_id"]), template["zip_s3_key"])
+        await process_template(str(template["_id"]), s3_key)
 
 # -----------------------------
 # Main
