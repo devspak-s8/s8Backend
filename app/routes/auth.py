@@ -1,6 +1,7 @@
 # app/routes/auth_routes.py
 from datetime import timedelta
 from fastapi import APIRouter, Body, Query, Security, HTTPException
+from fastapi.responses import RedirectResponse
 from app.middleware.rbac import get_current_user
 from app.schemas.user import *
 from app.utils.hash_utils import hash_password, verify_password
@@ -21,6 +22,52 @@ reset_tokens = {}
 verification_tokens = {}
 
 
+
+# ------------------------
+# Helper: send verification email
+# ------------------------
+async def trigger_verification_email(email: str):
+    user = await user_collection.find_one({"email": email})
+    if not user:
+        raise ErrorResponses.USER_NOT_FOUND
+
+    if user.get("is_verified"):
+        return {"msg": "Email already verified"}
+
+    token = str(uuid4())
+    expires_at = datetime.utcnow() + timedelta(days=7)
+
+    await user_collection.update_one(
+        {"email": email},
+        {"$set": {"verification_token": token, "token_expires_at": expires_at}}
+    )
+
+    verify_link = f"http://localhost:5173/verify-email?token={token}"
+    subject = "✅ Verify Your Email - S8Globals"
+    body = f"""
+    As-salaamu 'alaykum 👋,
+
+    Please verify your email by clicking the link below:
+
+    {verify_link}
+
+    If you did not register, simply ignore this message.
+
+    -- Team S8Globals
+    """
+
+    try:
+        send_email(email, subject, body)
+    except Exception as e:
+        print("SMTP send failed:", e)
+        raise ErrorResponses.INTERNAL_SERVER_ERROR
+
+    return {"msg": "✅ Verification email sent successfully"}
+
+
+# ------------------------
+# Register
+# ------------------------
 @auth_router.post("/register")
 async def register(data: RegisterSchema):
     user = await user_collection.find_one({"email": data.email})
@@ -28,33 +75,78 @@ async def register(data: RegisterSchema):
         raise ErrorResponses.USER_EXISTS
 
     hashed_pw = hash_password(data.password)
-    role = "admin" if (data.email == settings.ADMIN_EMAIL and data.password == settings.ADMIN_PASSWORD) else "user"
+    role = "admin" if (
+        data.email == settings.ADMIN_EMAIL and data.password == settings.ADMIN_PASSWORD
+    ) else "user"
 
-    user_data = {**data.dict(), "password": hashed_pw, "is_verified": False, "role": role}
-    await user_collection.insert_one(user_data)
-    return {"msg": "Registered successfully"}
+    # Insert new user
+    await user_collection.insert_one({
+        **data.dict(),
+        "password": hashed_pw,
+        "is_verified": False,
+        "role": role
+    })
+
+    # Trigger verification email automatically
+    await trigger_verification_email(data.email)
+
+    return {"msg": "✅ Registered successfully. Please check your email to verify your account."}
+
+
+# ------------------------
+# Login
+# ------------------------
 @auth_router.post("/login", response_model=TokenResponse)
 async def login(data: LoginSchema):
     user = await user_collection.find_one({"email": data.email})
     if not user or not verify_password(data.password, user["password"]):
         raise ErrorResponses.INVALID_CREDENTIALS
 
-    # Force is_verified to boolean
-    is_verified = bool(user.get("is_verified", False))
+    if not bool(user.get("is_verified", False)):
+        # Not verified → trigger email & block login
+        await trigger_verification_email(data.email)
+        raise HTTPException(
+            status_code=403,
+            detail="Email not verified. Verification link sent to your inbox."
+        )
 
+    # Verified → return tokens
     return {
-        "access_token": create_access_token({
-            "email": user["email"],
-            "role": user["role"]
-        }),
-        "refresh_token": create_refresh_token({
-            "email": user["email"],
-            "role": user["role"]
-        }, timedelta(days=7)),
-        "is_verified": is_verified,
+        "access_token": create_access_token({"email": user["email"], "role": user["role"]}),
+        "refresh_token": create_refresh_token({"email": user["email"], "role": user["role"]}, timedelta(days=7)),
+        "is_verified": True,
         "is_admin": user.get("role") == "admin"
     }
 
+
+# ------------------------
+# Verify Email
+# ------------------------
+@auth_router.get("/verify-email")
+async def verify_email(token: str = Query(...)):
+    # 1️⃣ Find user by token
+    user = await user_collection.find_one({"verification_token": token})
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    # 2️⃣ Check expiry
+    if datetime.utcnow() > user["token_expires_at"]:
+        raise HTTPException(status_code=400, detail="Token expired")
+
+    # 3️⃣ Update verified status
+    await user_collection.update_one(
+        {"_id": ObjectId(user["_id"])},
+        {"$set": {"is_verified": True}, "$unset": {"verification_token": "", "token_expires_at": ""}}
+    )
+
+    # 4️⃣ Auto-login: generate tokens
+    access_token = create_access_token({"email": user["email"], "role": user["role"]})
+    refresh_token = create_refresh_token({"email": user["email"], "role": user["role"]}, timedelta(days=7))
+
+    # 5️⃣ Redirect straight to dashboard with tokens
+    return RedirectResponse(
+        url=f"http://localhost:5173/dashboard?access_token={access_token}&refresh_token={refresh_token}"
+    )
 @auth_router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(refresh_token: str = Body(...)):
     try:
@@ -82,74 +174,7 @@ async def refresh_token(refresh_token: str = Body(...)):
         raise ErrorResponses.INVALID_TOKEN
 
 
-@auth_router.post("/send-verification-email")
-async def send_verification_email(data: EmailSchema):
-    email = data.email
 
-    # Fetch user from DB
-    user = await user_collection.find_one({"email": email})
-    if not user:
-        raise ErrorResponses.USER_NOT_FOUND
-
-    if user.get("is_verified"):
-        return {"msg": "Email already verified"}
-
-    # Generate token
-    token = str(uuid4())
-
-    # Save token + expiration in DB
-    expires_at = datetime.utcnow() + timedelta(hours=24)
-    await user_collection.update_one(
-        {"email": email},
-        {"$set": {"verification_token": token, "token_expires_at": expires_at}}
-    )
-    print("Token expires at:", user["token_expires_at"], type(user["token_expires_at"]))
-
-    # Email content
-    verify_link = f"http://localhost:5173/verify-email?token={token}"
-    subject = "✅ Verify Your Email - S8Globals"
-    body = f"""
-As-salaamu 'alaykum 👋,
-
-Thank you for registering at S8Builder! Please verify your email by clicking the link below:
-
-{verify_link}
-
-If you did not register, simply ignore this message.
-
--- Team S8Globals
-"""
-
-    try:
-        send_email(email, subject, body)
-    except Exception as e:
-        print("SMTP send failed:", e)
-        raise ErrorResponses.INTERNAL_SERVER_ERROR
-
-    return {"msg": "✅ Verification email sent successfully"}
-from fastapi.responses import RedirectResponse
-@auth_router.get("/verify-email")
-async def verify_email(token: str = Query(...)):
-    # 1️⃣ Find the user by token
-    user = await user_collection.find_one({"verification_token": token})
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid token")
-
-    # 2️⃣ Check if token expired
-    if datetime.utcnow() > user["token_expires_at"]:
-        raise HTTPException(status_code=400, detail="Token expired")
-
-    # 3️⃣ Update user to verified
-    await user_collection.update_one(
-        {"_id": ObjectId(user["_id"])},  # ✅ Proper ObjectId casting
-        {
-            "$set": {"is_verified": True},
-            "$unset": {"verification_token": "", "token_expires_at": ""}
-        }
-    )
-
-    # 4️⃣ Redirect to frontend login page
-    return RedirectResponse(url="http://localhost:5173/login?verified=true")
 @auth_router.post("/forgot-password")
 async def forgot_password(email: str):
     user = await user_collection.find_one({"email": email})

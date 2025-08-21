@@ -7,7 +7,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import logging
 
 from app.routes.auth import auth_router
+from app.routes.templates import template_router
 from app.routes.bookings import booking_router
+from app.routes.dashboard import dashboard_router
 from app.routes.ws import ws_router
 from app.database import user_collection
 
@@ -32,7 +34,8 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api/auth")
 app.include_router(booking_router, prefix="/api/bookings")
 app.include_router(ws_router, prefix="/api/ws")
-
+app.include_router(template_router, prefix="/api/templates")
+app.include_router(dashboard_router, prefix="/api/dashboard")
 # ✅ Register global exception handlers
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
