@@ -60,6 +60,14 @@ def upload_folder_to_s3(folder_path: str, s3_prefix: str):
             s3_key = f"{s3_prefix}/{relative_path.replace(os.sep, '/')}"
             s3_client.upload_file(full_path, settings.BUCKET_NAME, s3_key)
 
+def generate_presigned_url(s3_key: str, expiration: int = 3600) -> str:
+    """Generate a presigned URL for S3 object access."""
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.BUCKET_NAME, "Key": s3_key},
+        ExpiresIn=expiration
+    )
+
 # -----------------------------
 # Template processing
 # -----------------------------
@@ -79,8 +87,9 @@ async def process_template(template_id: str, s3_key: str):
         s3_preview_prefix = f"previews/{template_id}"
         upload_folder_to_s3(preview_local_path, s3_preview_prefix)
 
-        # Generate preview URL
-        preview_url = f"https://{settings.BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/{s3_preview_prefix}/index.html"
+        # Generate presigned URL for index.html
+        index_s3_key = f"{s3_preview_prefix}/index.html"
+        preview_url = generate_presigned_url(index_s3_key)
 
         # Update template status in DB
         await update_template_status(template_id, "ready", preview_url)
@@ -148,8 +157,6 @@ async def process_stuck_templates():
 # -----------------------------
 if __name__ == "__main__":
     os.makedirs(PREVIEW_FOLDER, exist_ok=True)
-
     loop = asyncio.get_event_loop()
     loop.run_until_complete(process_stuck_templates())
-
     poll_sqs()
