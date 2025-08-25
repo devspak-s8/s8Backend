@@ -5,133 +5,293 @@ import shutil
 import zipfile
 import time
 import asyncio
-from motor.motor_asyncio import AsyncIOMotorClient
+import tempfile
+import subprocess
+from typing import Optional, Tuple
+
 import boto3
+from motor.motor_asyncio import AsyncIOMotorClient
+
 from app.core.config import settings
 from app.template_service import update_template_status
 
 # -----------------------------
-# MongoDB setup (async)
+# MongoDB (async)
 # -----------------------------
 mongo_client = AsyncIOMotorClient(settings.MONGO_URL)
 db = mongo_client.get_default_database()
 template_collection = db["templates"]
 
 # -----------------------------
-# SQS & S3 clients
+# AWS clients
 # -----------------------------
-sqs_client = boto3.client(
+sqs = boto3.client(
     "sqs",
     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    region_name=settings.AWS_REGION
+    region_name=settings.AWS_REGION,
 )
-s3_client = boto3.client(
+s3 = boto3.client(
     "s3",
     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    region_name=settings.AWS_REGION
+    region_name=settings.AWS_REGION,
 )
 
-# -----------------------------
-# Local preview folder (temporary)
-# -----------------------------
-PREVIEW_FOLDER = "./previews"
+BUCKET = settings.BUCKET_NAME
+REGION = settings.AWS_REGION
 
 # -----------------------------
-# Helper functions
+# Utils
 # -----------------------------
-def download_s3_file(s3_key: str, local_path: str):
-    s3_client.download_file(settings.BUCKET_NAME, s3_key, local_path)
+def run(cmd, cwd=None, timeout=None, env=None):
+    """Run a shell command with robust logging & failure on non-zero exit."""
+    print(f"[Worker] $ {' '.join(cmd)} (cwd={cwd})")
+    res = subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        timeout=timeout,
+    )
+    if res.stdout:
+        print(res.stdout.strip())
+    return res
 
-def extract_zip(zip_path: str, extract_to: str):
-    if os.path.exists(extract_to):
-        shutil.rmtree(extract_to)
-    os.makedirs(extract_to, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_to)
+def safe_rmtree(path: str):
+    try:
+        if os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception as e:
+        print(f"[Worker] Cleanup warning for {path}: {e}")
+
+def unzip_to(zip_path: str, dst: str):
+    safe_rmtree(dst)
+    os.makedirs(dst, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dst)
 
 def upload_folder_to_s3(folder_path: str, s3_prefix: str):
-    """Upload all files in a folder to S3 preserving folder structure."""
-    for root, dirs, files in os.walk(folder_path):
-        for file in files:
-            full_path = os.path.join(root, file)
-            relative_path = os.path.relpath(full_path, folder_path)
-            s3_key = f"{s3_prefix}/{relative_path.replace(os.sep, '/')}"
-            s3_client.upload_file(full_path, settings.BUCKET_NAME, s3_key)
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, folder_path).replace(os.sep, "/")
+            key = f"{s3_prefix}/{rel}"
+            s3.upload_file(full, BUCKET, key)
 
-def generate_presigned_url(s3_key: str, expiration: int = 3600) -> str:
-    """Generate a presigned URL for S3 object access."""
-    return s3_client.generate_presigned_url(
+def presign(key: str, expires: int = 3600) -> str:
+    return s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": settings.BUCKET_NAME, "Key": s3_key},
-        ExpiresIn=expiration
+        Params={"Bucket": BUCKET, "Key": key},
+        ExpiresIn=expires,
     )
 
-# -----------------------------
-# Template processing
-# -----------------------------
-async def process_template(template_id: str, s3_key: str):
+def read_package_json(path: str) -> Optional[dict]:
+    pj = os.path.join(path, "package.json")
+    if not os.path.exists(pj):
+        return None
     try:
-        print(f"[Worker] Processing template {template_id}")
+        with open(pj, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[Worker] Failed to read package.json: {e}")
+        return None
 
-        # Download ZIP from S3
-        zip_local_path = f"/tmp/{os.path.basename(s3_key)}"
-        download_s3_file(s3_key, zip_local_path)
+def detect_framework(project_dir: str) -> Tuple[str, Optional[str]]:
+    """
+    Returns (framework, build_out_dir) where framework in:
+      'plain', 'cra', 'vite', 'next'
+    build_out_dir is best-guess relative dir.
+    """
+    pkg = read_package_json(project_dir)
+    if not pkg:
+        # No package.json -> treat as plain static
+        return "plain", None
 
-        # Extract ZIP locally
-        preview_local_path = os.path.join(PREVIEW_FOLDER, template_id)
-        extract_zip(zip_local_path, preview_local_path)
+    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    scripts = pkg.get("scripts", {})
 
-        # Upload extracted files to S3 under previews/{template_id}/
-        s3_preview_prefix = f"previews/{template_id}"
-        upload_folder_to_s3(preview_local_path, s3_preview_prefix)
+    has_react = "react" in deps
+    has_vite = "vite" in deps
+    has_next = "next" in deps
 
-        # Generate presigned URL for index.html
-        index_s3_key = f"{s3_preview_prefix}/index.html"
-        preview_url = generate_presigned_url(index_s3_key)
+    if has_next:
+        # Prefer static export if present; otherwise many Next templates still output .next
+        # We assume "next export" is configured via "export" or after "build".
+        # Our upload path will be "out" if it exists after build/export.
+        return "next", "out"
+    if has_vite:
+        return "vite", "dist"
+    if has_react:
+        # CRA or other react build -> default build/
+        return "cra", "build"
 
-        # Update template status in DB
+    # package.json but unknown; if there's a build script, try it and guess dist/build
+    if "build" in scripts:
+        # Guess common outputs
+        for guess in ("dist", "build", "out"):
+            if os.path.exists(os.path.join(project_dir, guess)):
+                return "unknown", guess
+        return "unknown", None
+
+    return "plain", None
+
+def ensure_build_output(project_dir: str, framework: str, guessed_dir: Optional[str]) -> Optional[str]:
+    # try common outputs if not provided
+    if guessed_dir:
+        p = os.path.join(project_dir, guessed_dir)
+        if os.path.exists(p):
+            return p
+    for guess in ("build", "dist", "out"):
+        p = os.path.join(project_dir, guess)
+        if os.path.exists(p):
+            return p
+    # as a last resort, if plain, serve root (must contain index.html)
+    if framework == "plain":
+        return project_dir
+    return None
+
+# -----------------------------
+# Core: build & publish
+# -----------------------------
+def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
+    """
+    Detects framework, installs deps, runs build if needed.
+    Returns (framework, output_dir) where output_dir is absolute.
+    Raises on failure.
+    """
+    framework, guess = detect_framework(project_dir)
+    print(f"[Worker] Detected framework: {framework} (guess out: {guess})")
+
+    if framework == "plain":
+        out = ensure_build_output(project_dir, framework, guess)
+        if not os.path.exists(os.path.join(out, "index.html")):
+            raise RuntimeError("Plain template missing index.html")
+        return framework, out
+
+    # Node required for the rest
+    env = os.environ.copy()
+    # Try faster + deterministic install; fallback to npm install if no lockfile
+    has_lock = any(os.path.exists(os.path.join(project_dir, lf)) for lf in ("package-lock.json", "npm-shrinkwrap.json"))
+    install_cmd = ["npm", "ci"] if has_lock else ["npm", "install", "--legacy-peer-deps"]
+    run(install_cmd, cwd=project_dir, timeout=20 * 60, env=env)
+
+    if framework == "next":
+        # build + export if available, else try 'next export' after build
+        # prefer user scripts if defined
+        pkg = read_package_json(project_dir) or {}
+        scripts = pkg.get("scripts", {})
+
+        if "build" in scripts:
+            run(["npm", "run", "build"], cwd=project_dir, timeout=30 * 60, env=env)
+        # run export if defined, otherwise attempt npx next export (best effort)
+        if "export" in scripts:
+            run(["npm", "run", "export"], cwd=project_dir, timeout=15 * 60, env=env)
+        else:
+            try:
+                run(["npx", "next", "export"], cwd=project_dir, timeout=15 * 60, env=env)
+            except Exception as e:
+                print(f"[Worker] next export fallback failed: {e}")
+
+    elif framework in ("vite", "cra", "unknown"):
+        run(["npm", "run", "build"], cwd=project_dir, timeout=30 * 60, env=env)
+
+    out_dir = ensure_build_output(project_dir, framework, guess)
+    if not out_dir:
+        raise RuntimeError("Could not locate build output folder (tried build/, dist/, out/).")
+    if not os.path.exists(os.path.join(out_dir, "index.html")):
+        raise RuntimeError("Build output missing index.html (SPA entry).")
+
+    return framework, out_dir
+
+async def process_template(template_id: str, upload_zip_key: str):
+    """
+    End-to-end:
+      - download user ZIP from S3
+      - extract to temp dir
+      - detect & build if needed
+      - upload build output to s3: previews/{template_id}/...
+      - generate presigned URL to index.html
+      - update DB
+    """
+    work_dir = None
+    zip_path = None
+    try:
+        print(f"[Worker] Processing template {template_id} (zip={upload_zip_key})")
+        work_dir = tempfile.mkdtemp(prefix=f"s8builder_{template_id}_")
+        zip_path = os.path.join(work_dir, os.path.basename(upload_zip_key))
+        s3.download_file(BUCKET, upload_zip_key, zip_path)
+
+        extract_dir = os.path.join(work_dir, "src")
+        unzip_to(zip_path, extract_dir)
+
+        # optional: if archive has a single top-level folder, flatten into extract_dir
+        entries = [e for e in os.listdir(extract_dir) if not e.startswith(".")]
+        if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+            extract_dir = os.path.join(extract_dir, entries[0])
+
+        # Build (or pass-through)
+        framework, out_dir = build_project_if_needed(extract_dir)
+        print(f"[Worker] Build complete. Framework={framework}, out={out_dir}")
+
+        # Upload
+        s3_prefix = f"previews/{template_id}"
+        upload_folder_to_s3(out_dir, s3_prefix)
+        index_key = f"{s3_prefix}/index.html"
+
+        # Presigned preview URL
+        preview_url = presign(index_key, expires=3600)
+
         await update_template_status(template_id, "ready", preview_url)
-
-        # Cleanup
-        os.remove(zip_local_path)
-        shutil.rmtree(preview_local_path)
         print(f"[Worker] Template {template_id} ready at {preview_url}")
 
+    except subprocess.CalledProcessError as e:
+        print(f"[Worker] Build command failed (code {e.returncode}): {e.stdout}")
+        await update_template_status(template_id, "error", None)
     except Exception as e:
         print(f"[Worker] Error processing template {template_id}: {e}")
+        await update_template_status(template_id, "error", None)
+    finally:
+        if zip_path and os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+        if work_dir:
+            safe_rmtree(work_dir)
 
 # -----------------------------
-# Process single SQS message
+# SQS consumption
 # -----------------------------
-async def process_message(message):
-    body = json.loads(message['Body'])
-    template_id = body['template_id']
-    s3_key = body['s3_key']
+async def process_message(msg):
+    body = json.loads(msg["Body"])
+    template_id = body["template_id"]
+    s3_key = body["s3_key"]
     await process_template(template_id, s3_key)
 
-# -----------------------------
-# Continuous SQS polling
-# -----------------------------
 def poll_sqs():
     print("[Worker] Starting SQS polling...")
     loop = asyncio.get_event_loop()
     while True:
         try:
-            response = sqs_client.receive_message(
+            resp = sqs.receive_message(
                 QueueUrl=settings.SQS_QUEUE_URL,
-                MaxNumberOfMessages=10,
-                WaitTimeSeconds=20
+                MaxNumberOfMessages=5,
+                WaitTimeSeconds=20,
+                VisibilityTimeout=300,  # give enough time for builds
             )
-            messages = response.get("Messages", [])
-            for msg in messages:
+            msgs = resp.get("Messages", [])
+            if not msgs:
+                continue
+            for m in msgs:
                 try:
-                    loop.run_until_complete(process_message(msg))
-                    # delete after successful processing
-                    sqs_client.delete_message(
+                    loop.run_until_complete(process_message(m))
+                    sqs.delete_message(
                         QueueUrl=settings.SQS_QUEUE_URL,
-                        ReceiptHandle=msg["ReceiptHandle"]
+                        ReceiptHandle=m["ReceiptHandle"],
                     )
                 except Exception as e:
                     print(f"[Worker] Error processing message: {e}")
@@ -140,23 +300,21 @@ def poll_sqs():
             time.sleep(5)
 
 # -----------------------------
-# Process stuck templates
+# Recover "pending"
 # -----------------------------
 async def process_stuck_templates():
-    stuck_templates = template_collection.find({"status": "pending"})
-    async for template in stuck_templates:
-        s3_key = template.get("zip_s3_key")
+    async for t in template_collection.find({"status": "pending"}):
+        s3_key = t.get("zip_s3_key")
         if not s3_key:
-            print(f"[Worker] Skipping template {template['_id']} — no zip_s3_key found")
+            print(f"[Worker] Skipping {t['_id']} — no zip_s3_key")
             continue
-        print(f"[Worker] Found stuck template {template['_id']}, processing...")
-        await process_template(str(template["_id"]), s3_key)
+        print(f"[Worker] Recovering pending template {t['_id']}")
+        await process_template(str(t["_id"]), s3_key)
 
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    os.makedirs(PREVIEW_FOLDER, exist_ok=True)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(process_stuck_templates())
     poll_sqs()
