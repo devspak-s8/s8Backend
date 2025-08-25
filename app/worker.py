@@ -5,15 +5,16 @@ import shutil
 import zipfile
 import time
 import asyncio
-import tempfile
-import subprocess
-from typing import Optional, Tuple
+import tempfile 
+import subprocess   
+from typing import Optional, Tuple # for type hints
 
-import boto3
-from motor.motor_asyncio import AsyncIOMotorClient
+import psutil # for process management
+import boto3 # AWS SDK
+from motor.motor_asyncio import AsyncIOMotorClient # async MongoDB client
 
-from app.core.config import settings
-from app.template_service import update_template_status
+from app.core.config import settings # app settings
+from app.template_service import update_template_status # update template status
 
 # -----------------------------
 # MongoDB (async)
@@ -61,22 +62,33 @@ logger.addHandler(handler)
 # -----------------------------
 # Utils
 # -----------------------------
-def run(cmd, cwd=None, timeout=None, env=None):
-    """Run a shell command with logging & fail on non-zero exit."""
+def run_with_timeout(cmd, cwd=None, timeout=None, env=None):
+    """Run a shell command and forcibly kill if it exceeds timeout."""
     logger.info(f"$ {' '.join(cmd)} (cwd={cwd})")
-    res = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=cwd,
-        check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=env,
-        timeout=timeout,
     )
-    if res.stdout:
-        logger.info(res.stdout.strip())
-    return res
+
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        if out:
+            logger.info(out.strip())
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, out)
+        return out
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command timed out after {timeout} seconds: {' '.join(cmd)}")
+        # Kill the process tree
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            child.kill()
+        parent.kill()
+        raise RuntimeError(f"Timeout expired for command: {' '.join(cmd)}")
 
 def safe_rmtree(path: str):
     try:
@@ -173,24 +185,24 @@ def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
     env = os.environ.copy()
     has_lock = any(os.path.exists(os.path.join(project_dir, lf)) for lf in ("package-lock.json", "npm-shrinkwrap.json"))
     install_cmd = ["npm", "ci"] if has_lock else ["npm", "install", "--legacy-peer-deps"]
-    run(install_cmd, cwd=project_dir, timeout=20*60, env=env)
+    run_with_timeout(install_cmd, cwd=project_dir, timeout=20*60, env=env)
 
     if framework == "next":
         pkg = read_package_json(project_dir) or {}
         scripts = pkg.get("scripts", {})
 
         if "build" in scripts:
-            run(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
+            run_with_timeout(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
         if "export" in scripts:
-            run(["npm", "run", "export"], cwd=project_dir, timeout=15*60, env=env)
+            run_with_timeout(["npm", "run", "export"], cwd=project_dir, timeout=15*60, env=env)
         else:
             try:
-                run(["npx", "next", "export"], cwd=project_dir, timeout=15*60, env=env)
+                run_with_timeout(["npx", "next", "export"], cwd=project_dir, timeout=15*60, env=env)
             except Exception as e:
                 logger.warning(f"next export fallback failed: {e}")
 
     elif framework in ("vite", "cra", "unknown"):
-        run(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
+        run_with_timeout(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
 
     out_dir = ensure_build_output(project_dir, framework, guess)
     if not out_dir:
@@ -228,7 +240,7 @@ async def process_template(template_id: str, upload_zip_key: str):
         logger.info(f"Template {template_id} ready at {preview_url}")
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Build command failed (code {e.returncode}): {e.stdout}")
+        logger.error(f"Build command failed (code {e.returncode}): {e.output}")
         await update_template_status(template_id, "error", None)
     except Exception as e:
         logger.error(f"Error processing template {template_id}: {e}")
