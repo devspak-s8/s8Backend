@@ -42,11 +42,28 @@ BUCKET = settings.BUCKET_NAME
 REGION = settings.AWS_REGION
 
 # -----------------------------
+# Logging
+# -----------------------------
+import logging
+from logging.handlers import RotatingFileHandler
+
+LOG_DIR = "/home/ec2-user/s8Backend/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("s8worker")
+logger.setLevel(logging.INFO)
+log_file = os.path.join(LOG_DIR, "worker.log")
+handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5)
+formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# -----------------------------
 # Utils
 # -----------------------------
 def run(cmd, cwd=None, timeout=None, env=None):
-    """Run a shell command with robust logging & failure on non-zero exit."""
-    print(f"[Worker] $ {' '.join(cmd)} (cwd={cwd})")
+    """Run a shell command with logging & fail on non-zero exit."""
+    logger.info(f"$ {' '.join(cmd)} (cwd={cwd})")
     res = subprocess.run(
         cmd,
         cwd=cwd,
@@ -58,7 +75,7 @@ def run(cmd, cwd=None, timeout=None, env=None):
         timeout=timeout,
     )
     if res.stdout:
-        print(res.stdout.strip())
+        logger.info(res.stdout.strip())
     return res
 
 def safe_rmtree(path: str):
@@ -66,7 +83,7 @@ def safe_rmtree(path: str):
         if os.path.exists(path):
             shutil.rmtree(path, ignore_errors=True)
     except Exception as e:
-        print(f"[Worker] Cleanup warning for {path}: {e}")
+        logger.warning(f"Cleanup warning for {path}: {e}")
 
 def unzip_to(zip_path: str, dst: str):
     safe_rmtree(dst)
@@ -97,18 +114,12 @@ def read_package_json(path: str) -> Optional[dict]:
         with open(pj, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[Worker] Failed to read package.json: {e}")
+        logger.warning(f"Failed to read package.json: {e}")
         return None
 
 def detect_framework(project_dir: str) -> Tuple[str, Optional[str]]:
-    """
-    Returns (framework, build_out_dir) where framework in:
-      'plain', 'cra', 'vite', 'next'
-    build_out_dir is best-guess relative dir.
-    """
     pkg = read_package_json(project_dir)
     if not pkg:
-        # No package.json -> treat as plain static
         return "plain", None
 
     deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
@@ -119,19 +130,13 @@ def detect_framework(project_dir: str) -> Tuple[str, Optional[str]]:
     has_next = "next" in deps
 
     if has_next:
-        # Prefer static export if present; otherwise many Next templates still output .next
-        # We assume "next export" is configured via "export" or after "build".
-        # Our upload path will be "out" if it exists after build/export.
         return "next", "out"
     if has_vite:
         return "vite", "dist"
     if has_react:
-        # CRA or other react build -> default build/
         return "cra", "build"
 
-    # package.json but unknown; if there's a build script, try it and guess dist/build
     if "build" in scripts:
-        # Guess common outputs
         for guess in ("dist", "build", "out"):
             if os.path.exists(os.path.join(project_dir, guess)):
                 return "unknown", guess
@@ -140,7 +145,6 @@ def detect_framework(project_dir: str) -> Tuple[str, Optional[str]]:
     return "plain", None
 
 def ensure_build_output(project_dir: str, framework: str, guessed_dir: Optional[str]) -> Optional[str]:
-    # try common outputs if not provided
     if guessed_dir:
         p = os.path.join(project_dir, guessed_dir)
         if os.path.exists(p):
@@ -149,7 +153,6 @@ def ensure_build_output(project_dir: str, framework: str, guessed_dir: Optional[
         p = os.path.join(project_dir, guess)
         if os.path.exists(p):
             return p
-    # as a last resort, if plain, serve root (must contain index.html)
     if framework == "plain":
         return project_dir
     return None
@@ -158,13 +161,8 @@ def ensure_build_output(project_dir: str, framework: str, guessed_dir: Optional[
 # Core: build & publish
 # -----------------------------
 def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
-    """
-    Detects framework, installs deps, runs build if needed.
-    Returns (framework, output_dir) where output_dir is absolute.
-    Raises on failure.
-    """
     framework, guess = detect_framework(project_dir)
-    print(f"[Worker] Detected framework: {framework} (guess out: {guess})")
+    logger.info(f"Detected framework: {framework} (guess out: {guess})")
 
     if framework == "plain":
         out = ensure_build_output(project_dir, framework, guess)
@@ -172,32 +170,27 @@ def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
             raise RuntimeError("Plain template missing index.html")
         return framework, out
 
-    # Node required for the rest
     env = os.environ.copy()
-    # Try faster + deterministic install; fallback to npm install if no lockfile
     has_lock = any(os.path.exists(os.path.join(project_dir, lf)) for lf in ("package-lock.json", "npm-shrinkwrap.json"))
     install_cmd = ["npm", "ci"] if has_lock else ["npm", "install", "--legacy-peer-deps"]
-    run(install_cmd, cwd=project_dir, timeout=20 * 60, env=env)
+    run(install_cmd, cwd=project_dir, timeout=20*60, env=env)
 
     if framework == "next":
-        # build + export if available, else try 'next export' after build
-        # prefer user scripts if defined
         pkg = read_package_json(project_dir) or {}
         scripts = pkg.get("scripts", {})
 
         if "build" in scripts:
-            run(["npm", "run", "build"], cwd=project_dir, timeout=30 * 60, env=env)
-        # run export if defined, otherwise attempt npx next export (best effort)
+            run(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
         if "export" in scripts:
-            run(["npm", "run", "export"], cwd=project_dir, timeout=15 * 60, env=env)
+            run(["npm", "run", "export"], cwd=project_dir, timeout=15*60, env=env)
         else:
             try:
-                run(["npx", "next", "export"], cwd=project_dir, timeout=15 * 60, env=env)
+                run(["npx", "next", "export"], cwd=project_dir, timeout=15*60, env=env)
             except Exception as e:
-                print(f"[Worker] next export fallback failed: {e}")
+                logger.warning(f"next export fallback failed: {e}")
 
     elif framework in ("vite", "cra", "unknown"):
-        run(["npm", "run", "build"], cwd=project_dir, timeout=30 * 60, env=env)
+        run(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
 
     out_dir = ensure_build_output(project_dir, framework, guess)
     if not out_dir:
@@ -208,19 +201,10 @@ def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
     return framework, out_dir
 
 async def process_template(template_id: str, upload_zip_key: str):
-    """
-    End-to-end:
-      - download user ZIP from S3
-      - extract to temp dir
-      - detect & build if needed
-      - upload build output to s3: previews/{template_id}/...
-      - generate presigned URL to index.html
-      - update DB
-    """
     work_dir = None
     zip_path = None
     try:
-        print(f"[Worker] Processing template {template_id} (zip={upload_zip_key})")
+        logger.info(f"Processing template {template_id} (zip={upload_zip_key})")
         work_dir = tempfile.mkdtemp(prefix=f"s8builder_{template_id}_")
         zip_path = os.path.join(work_dir, os.path.basename(upload_zip_key))
         s3.download_file(BUCKET, upload_zip_key, zip_path)
@@ -228,40 +212,32 @@ async def process_template(template_id: str, upload_zip_key: str):
         extract_dir = os.path.join(work_dir, "src")
         unzip_to(zip_path, extract_dir)
 
-        # optional: if archive has a single top-level folder, flatten into extract_dir
         entries = [e for e in os.listdir(extract_dir) if not e.startswith(".")]
         if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
             extract_dir = os.path.join(extract_dir, entries[0])
 
-        # Build (or pass-through)
         framework, out_dir = build_project_if_needed(extract_dir)
-        print(f"[Worker] Build complete. Framework={framework}, out={out_dir}")
+        logger.info(f"Build complete. Framework={framework}, out={out_dir}")
 
-        # Upload
         s3_prefix = f"previews/{template_id}"
         upload_folder_to_s3(out_dir, s3_prefix)
         index_key = f"{s3_prefix}/index.html"
 
-        # Presigned preview URL
         preview_url = presign(index_key, expires=3600)
-
         await update_template_status(template_id, "ready", preview_url)
-        print(f"[Worker] Template {template_id} ready at {preview_url}")
+        logger.info(f"Template {template_id} ready at {preview_url}")
 
     except subprocess.CalledProcessError as e:
-        print(f"[Worker] Build command failed (code {e.returncode}): {e.stdout}")
+        logger.error(f"Build command failed (code {e.returncode}): {e.stdout}")
         await update_template_status(template_id, "error", None)
     except Exception as e:
-        print(f"[Worker] Error processing template {template_id}: {e}")
+        logger.error(f"Error processing template {template_id}: {e}")
         await update_template_status(template_id, "error", None)
     finally:
         if zip_path and os.path.exists(zip_path):
-            try:
-                os.remove(zip_path)
-            except Exception:
-                pass
-        if work_dir:
-            safe_rmtree(work_dir)
+            try: os.remove(zip_path)
+            except Exception: pass
+        if work_dir: safe_rmtree(work_dir)
 
 # -----------------------------
 # SQS consumption
@@ -273,7 +249,7 @@ async def process_message(msg):
     await process_template(template_id, s3_key)
 
 def poll_sqs():
-    print("[Worker] Starting SQS polling...")
+    logger.info("Starting SQS polling...")
     loop = asyncio.get_event_loop()
     while True:
         try:
@@ -281,7 +257,7 @@ def poll_sqs():
                 QueueUrl=settings.SQS_QUEUE_URL,
                 MaxNumberOfMessages=5,
                 WaitTimeSeconds=20,
-                VisibilityTimeout=300,  # give enough time for builds
+                VisibilityTimeout=300,
             )
             msgs = resp.get("Messages", [])
             if not msgs:
@@ -294,9 +270,9 @@ def poll_sqs():
                         ReceiptHandle=m["ReceiptHandle"],
                     )
                 except Exception as e:
-                    print(f"[Worker] Error processing message: {e}")
+                    logger.error(f"Error processing message: {e}")
         except Exception as e:
-            print(f"[Worker] Error polling SQS: {e}")
+            logger.error(f"Error polling SQS: {e}")
             time.sleep(5)
 
 # -----------------------------
@@ -306,9 +282,9 @@ async def process_stuck_templates():
     async for t in template_collection.find({"status": "pending"}):
         s3_key = t.get("zip_s3_key")
         if not s3_key:
-            print(f"[Worker] Skipping {t['_id']} — no zip_s3_key")
+            logger.warning(f"Skipping {t['_id']} — no zip_s3_key")
             continue
-        print(f"[Worker] Recovering pending template {t['_id']}")
+        logger.info(f"Recovering pending template {t['_id']}")
         await process_template(str(t["_id"]), s3_key)
 
 # -----------------------------
