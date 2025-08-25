@@ -5,16 +5,18 @@ import shutil
 import zipfile
 import time
 import asyncio
-import tempfile 
-import subprocess   
-from typing import Optional, Tuple # for type hints
+import tempfile
+import subprocess
+import signal
+import sys
+from typing import Optional, Tuple
 
-import psutil # for process management
-import boto3 # AWS SDK
-from motor.motor_asyncio import AsyncIOMotorClient # async MongoDB client
+import psutil
+import boto3
+from motor.motor_asyncio import AsyncIOMotorClient
 
-from app.core.config import settings # app settings
-from app.template_service import update_template_status # update template status
+from app.core.config import settings
+from app.template_service import update_template_status
 
 # -----------------------------
 # MongoDB (async)
@@ -38,7 +40,6 @@ s3 = boto3.client(
     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
     region_name=settings.AWS_REGION,
 )
-
 BUCKET = settings.BUCKET_NAME
 REGION = settings.AWS_REGION
 
@@ -60,10 +61,22 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # -----------------------------
+# Graceful shutdown
+# -----------------------------
+stop_flag = False
+
+def handle_shutdown(sig, frame):
+    global stop_flag
+    logger.info(f"Received shutdown signal: {sig}. Stopping worker...")
+    stop_flag = True
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
+
+# -----------------------------
 # Utils
 # -----------------------------
 def run_with_timeout(cmd, cwd=None, timeout=None, env=None):
-    """Run a shell command and forcibly kill if it exceeds timeout."""
     logger.info(f"$ {' '.join(cmd)} (cwd={cwd})")
     proc = subprocess.Popen(
         cmd,
@@ -83,7 +96,6 @@ def run_with_timeout(cmd, cwd=None, timeout=None, env=None):
         return out
     except subprocess.TimeoutExpired:
         logger.error(f"Command timed out after {timeout} seconds: {' '.join(cmd)}")
-        # Kill the process tree
         parent = psutil.Process(proc.pid)
         for child in parent.children(recursive=True):
             child.kill()
@@ -133,27 +145,17 @@ def detect_framework(project_dir: str) -> Tuple[str, Optional[str]]:
     pkg = read_package_json(project_dir)
     if not pkg:
         return "plain", None
-
     deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
     scripts = pkg.get("scripts", {})
-
-    has_react = "react" in deps
-    has_vite = "vite" in deps
-    has_next = "next" in deps
-
-    if has_next:
+    if "next" in deps:
         return "next", "out"
-    if has_vite:
+    if "vite" in deps:
         return "vite", "dist"
-    if has_react:
+    if "react" in deps:
         return "cra", "build"
-
-    if "build" in scripts:
-        for guess in ("dist", "build", "out"):
-            if os.path.exists(os.path.join(project_dir, guess)):
-                return "unknown", guess
-        return "unknown", None
-
+    for guess in ("dist", "build", "out"):
+        if os.path.exists(os.path.join(project_dir, guess)):
+            return "unknown", guess
     return "plain", None
 
 def ensure_build_output(project_dir: str, framework: str, guessed_dir: Optional[str]) -> Optional[str]:
@@ -170,12 +172,11 @@ def ensure_build_output(project_dir: str, framework: str, guessed_dir: Optional[
     return None
 
 # -----------------------------
-# Core: build & publish
+# Build & publish
 # -----------------------------
 def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
     framework, guess = detect_framework(project_dir)
     logger.info(f"Detected framework: {framework} (guess out: {guess})")
-
     if framework == "plain":
         out = ensure_build_output(project_dir, framework, guess)
         if not os.path.exists(os.path.join(out, "index.html")):
@@ -190,7 +191,6 @@ def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
     if framework == "next":
         pkg = read_package_json(project_dir) or {}
         scripts = pkg.get("scripts", {})
-
         if "build" in scripts:
             run_with_timeout(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
         if "export" in scripts:
@@ -200,16 +200,12 @@ def build_project_if_needed(project_dir: str) -> Tuple[str, str]:
                 run_with_timeout(["npx", "next", "export"], cwd=project_dir, timeout=15*60, env=env)
             except Exception as e:
                 logger.warning(f"next export fallback failed: {e}")
-
     elif framework in ("vite", "cra", "unknown"):
         run_with_timeout(["npm", "run", "build"], cwd=project_dir, timeout=30*60, env=env)
 
     out_dir = ensure_build_output(project_dir, framework, guess)
-    if not out_dir:
-        raise RuntimeError("Could not locate build output folder (tried build/, dist/, out/).")
-    if not os.path.exists(os.path.join(out_dir, "index.html")):
+    if not out_dir or not os.path.exists(os.path.join(out_dir, "index.html")):
         raise RuntimeError("Build output missing index.html (SPA entry).")
-
     return framework, out_dir
 
 async def process_template(template_id: str, upload_zip_key: str):
@@ -223,7 +219,6 @@ async def process_template(template_id: str, upload_zip_key: str):
 
         extract_dir = os.path.join(work_dir, "src")
         unzip_to(zip_path, extract_dir)
-
         entries = [e for e in os.listdir(extract_dir) if not e.startswith(".")]
         if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
             extract_dir = os.path.join(extract_dir, entries[0])
@@ -263,7 +258,7 @@ async def process_message(msg):
 def poll_sqs():
     logger.info("Starting SQS polling...")
     loop = asyncio.get_event_loop()
-    while True:
+    while not stop_flag:
         try:
             resp = sqs.receive_message(
                 QueueUrl=settings.SQS_QUEUE_URL,
@@ -272,8 +267,6 @@ def poll_sqs():
                 VisibilityTimeout=300,
             )
             msgs = resp.get("Messages", [])
-            if not msgs:
-                continue
             for m in msgs:
                 try:
                     loop.run_until_complete(process_message(m))
@@ -286,9 +279,10 @@ def poll_sqs():
         except Exception as e:
             logger.error(f"Error polling SQS: {e}")
             time.sleep(5)
+    logger.info("Exiting SQS poll loop. Worker stopped.")
 
 # -----------------------------
-# Recover "pending"
+# Recover pending templates
 # -----------------------------
 async def process_stuck_templates():
     async for t in template_collection.find({"status": "pending"}):
@@ -306,3 +300,5 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(process_stuck_templates())
     poll_sqs()
+    logger.info("Worker shutdown complete.")
+    sys.exit(0)
